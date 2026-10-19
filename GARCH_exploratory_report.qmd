@@ -107,7 +107,7 @@ p1 <- ggplot(train, aes(Date, log_change)) +
 p1
 ```
 
-**Interpretation to complete:** Identify any periods with visibly elevated return dispersion. Clustering apparent in this graph is suggestive rather than a formal statistical test.
+As we can see, there appears to be multiple periods of different avergae dispersion. INPUT CHANGEPOINT DETECTION.
 
 ## Squared returns as a volatility proxy
 
