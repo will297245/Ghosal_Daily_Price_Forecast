@@ -1,0 +1,393 @@
+---
+title: "Exploratory Analysis of AAPL Return Volatility"
+subtitle: "Volatility clustering, Student-t GARCH models, and out-of-sample evaluation"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: true
+    code-summary: "Show R code"
+    theme: cosmo
+    df-print: paged
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: false
+fig-width: 10
+fig-height: 5
+---
+
+# Research objective
+
+This exploratory study investigates whether AAPL daily log returns display volatility clustering, whether a GARCH model can account for conditional heteroskedasticity, and how a fixed-parameter Student-t GARCH(1,1) model tracks squared innovations in a chronological holdout sample.
+
+**Scope.** This report is descriptive and diagnostic; it does not establish that a GARCH model generates profitable trading signals. The out-of-sample squared innovation is a noisy *proxy* for latent variance, not an observed conditional variance.
+
+# Data and preparation
+
+Data are retrieved from Yahoo Finance at render time. The feature construction and chronological 80/20 split follow the supplied data-cleaning script. All GARCH fits use training observations only. AAPL daily log returns are multiplied by 100 before fitting, so conditional variances and squared innovations are expressed in **squared percentage-return units**.
+
+```{r}
+#| label: setup
+#| include: false
+required <- c("quantmod", "zoo", "TTR", "ggplot2", "rugarch", "FinTS", "knitr")
+missing <- required[!vapply(required, requireNamespace, quietly = TRUE, FUN.VALUE = logical(1))]
+if (length(missing)) stop("Install required R packages: install.packages(c(", paste(sprintf('"%s"', missing), collapse = ", "), "))")
+library(quantmod)
+library(zoo)
+library(TTR)
+library(ggplot2)
+library(rugarch)
+library(FinTS)
+library(knitr)
+options(scipen = 5)
+```
+
+```{r}
+#| label: data
+stock <- getSymbols("AAPL", src = "yahoo", from = "2021-01-01", auto.assign = FALSE)
+market <- getSymbols("^GSPC", src = "yahoo", from = "2021-01-01", auto.assign = FALSE)
+
+prices <- Ad(stock)
+volume <- Vo(stock)
+market_prices <- Ad(market)
+log_returns <- diff(log(prices))
+market_returns <- diff(log(market_prices))
+
+features <- merge(
+  prices,
+  log_returns,
+  rollmean(log_returns, 5, fill = NA, align = "right"),
+  rollmean(log_returns, 20, fill = NA, align = "right"),
+  rollapply(log_returns, 5, sd, fill = NA, align = "right"),
+  rollapply(log_returns, 20, sd, fill = NA, align = "right"),
+  diff(log(volume)),
+  RSI(Cl(stock), n = 14),
+  market_returns
+)
+colnames(features) <- c(
+  "Price", "log_change", "momentum_5", "momentum_20",
+  "volatility_5", "volatility_20", "volume_change", "rsi", "market_return"
+)
+
+data <- data.frame(Date = as.Date(index(features)), coredata(features), row.names = NULL)
+data$target <- c(data$log_change[-1], NA_real_)
+data <- na.omit(data)
+data <- data[order(data$Date), ]
+smp_size <- floor(0.80 * nrow(data))
+train <- data[seq_len(smp_size), , drop = FALSE]
+test <- data[seq.int(smp_size + 1, nrow(data)), , drop = FALSE]
+train$squared_returns <- train$log_change^2
+returns <- 100 * as.numeric(train$log_change)
+
+split_table <- data.frame(
+  Subsample = c("Training", "Test"),
+  Observations = c(nrow(train), nrow(test)),
+  First_day = c(min(train$Date), min(test$Date)),
+  Last_day = c(max(train$Date), max(test$Date))
+)
+kable(split_table, caption = "Chronological train/test split")
+```
+
+The preprocessing retains rows with complete values across all engineered variables, and drops the final row because the one-step-ahead `target` is unavailable. Those additional predictors are preserved from the source workflow but are **not** used as regressors in the univariate GARCH specification.
+
+# Exploratory analysis of volatility clustering
+
+## Daily log returns
+
+```{r}
+#| label: fig-returns
+#| fig-cap: "AAPL daily log returns in the training sample"
+p1 <- ggplot(train, aes(Date, log_change)) +
+  geom_point(alpha = 0.55, size = 0.75, colour = "#2b5876") +
+  labs(x = "Date", y = "Daily log return", title = "Training-period daily log returns") +
+  theme_minimal()
+p1
+```
+
+**Interpretation to complete:** Identify any periods with visibly elevated return dispersion. Clustering apparent in this graph is suggestive rather than a formal statistical test.
+
+## Squared returns as a volatility proxy
+
+```{r}
+#| label: fig-squared
+#| fig-cap: "Squared AAPL daily log returns in the training sample"
+p2 <- ggplot(train, aes(Date, squared_returns)) +
+  geom_point(alpha = 0.55, size = 0.75, colour = "#a54a42") +
+  labs(x = "Date", y = "Squared daily log return", title = "Squared training-period returns") +
+  theme_minimal()
+p2
+```
+
+Squared returns proxy variation in the unobserved return variance, but are extremely noisy measures of it. Thus, individual squared-return spikes need not be matched by equally large model conditional-variance estimates.
+
+## Autocorrelation: returns versus squared returns
+
+```{r}
+#| label: fig-acf-returns
+#| fig-cap: "Sample ACF of training-period daily log returns"
+acf(train$log_change, main = "ACF: daily log returns", na.action = na.pass)
+```
+
+```{r}
+#| label: fig-acf-squared
+#| fig-cap: "Sample ACF of training-period squared daily log returns"
+acf(train$squared_returns, main = "ACF: squared daily log returns", na.action = na.pass)
+```
+
+**Interpretation to complete:** Compare the magnitude and persistence of sample correlations in returns and squared returns. Significant squared-return autocorrelation would be consistent with time-varying conditional volatility.
+
+## ARCH-LM test
+
+The ARCH-LM test investigates whether past squared demeaned returns help explain the current squared demeaned return. The null is **no ARCH effects up to the specified lag order**.
+
+```{r}
+#| label: arch-test
+arch_test <- ArchTest(returns, lags = 10, demean = TRUE)
+kable(data.frame(
+  Test = "ARCH-LM (10 lags)",
+  Statistic = unname(arch_test$statistic),
+  p_value = arch_test$p.value
+), digits = 5)
+```
+
+**Interpretation to complete:** Report the p-value and the decision at your chosen significance level. Rejection supports conditional heteroskedasticity, but does not uniquely establish a particular GARCH order or innovation distribution.
+
+# Statistical model
+
+Let $r_t$ denote a **percentage** daily log return. Under a constant conditional-mean specification,
+
+$$
+r_t = \mu + \varepsilon_t, \qquad \varepsilon_t = \sigma_t z_t,
+$$
+
+with $\mathbb{E}[z_t]=0$ and $\operatorname{Var}(z_t)=1$. For an sGARCH(1,1) model,
+
+$$
+\sigma_t^2 = \omega + \alpha_1\varepsilon_{t-1}^2
++ \beta_1\sigma_{t-1}^2.
+$$
+
+Here $\omega > 0$, $\alpha_1 \geq 0$, and $\beta_1 \geq 0$. In the conventional stationary case with $\alpha_1 + \beta_1 < 1$, the unconditional variance is $\omega/(1-\alpha_1-\beta_1)$. The Student-t variant uses the standardized Student-t innovation distribution (`distribution.model = "std"` in `rugarch`), with estimated shape parameter $\nu$.
+
+# Innovation distribution comparison
+
+Hold the volatility specification fixed at GARCH(1,1), and compare Normal, standardized Student-t, and standardized skewed Student-t innovations using information criteria. The fits are based exclusively on the training sample.
+
+```{r}
+#| label: fit-distributions
+make_spec <- function(distribution) {
+  ugarchspec(
+    variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+    mean.model = list(armaOrder = c(0, 0), include.mean = TRUE),
+    distribution.model = distribution
+  )
+}
+fit_norm <- ugarchfit(spec = make_spec("norm"), data = returns)
+fit_t <- ugarchfit(spec = make_spec("std"), data = returns)
+fit_skewt <- ugarchfit(spec = make_spec("sstd"), data = returns)
+
+stopifnot(all(vapply(
+  list(fit_norm, fit_t, fit_skewt),
+  function(f) f@fit$convergence == 0,
+  logical(1)
+)))
+comparison <- data.frame(
+  Model = c("Normal", "Student-t", "Skewed Student-t"),
+  AIC = vapply(list(fit_norm, fit_t, fit_skewt), function(f) unname(infocriteria(f)[1]), numeric(1)),
+  BIC = vapply(list(fit_norm, fit_t, fit_skewt), function(f) unname(infocriteria(f)[2]), numeric(1))
+)
+kable(comparison[order(comparison$BIC), ], digits = 4,
+      caption = "Distribution comparison: smaller AIC/BIC values preferred")
+```
+
+The selected **working model** for the subsequent plots is Student-t GARCH(1,1), consistent with the supplied R analysis. Check the table before stating that the Student-t distribution is optimal: AIC and BIC can select different distributions.
+
+# GARCH order comparison
+
+The source script searches $p,q\in\{1,2,3,4,5\}$ under standardized Student-t innovations and ranks converged fits using BIC. This may require substantial computation.
+
+```{r}
+#| label: order-search
+orders <- expand.grid(p = 1:5, q = 1:5)
+fit_rows <- list()
+fits <- list()
+for (i in seq_len(nrow(orders))) {
+  p <- orders$p[i]
+  q <- orders$q[i]
+  spec <- ugarchspec(
+    variance.model = list(model = "sGARCH", garchOrder = c(p, q)),
+    mean.model = list(armaOrder = c(0, 0), include.mean = TRUE),
+    distribution.model = "std"
+  )
+  fit <- tryCatch(suppressWarnings(ugarchfit(spec = spec, data = returns)),
+                  error = function(e) NULL)
+  if (is.null(fit) || fit@fit$convergence != 0) next
+  model_name <- sprintf("GARCH(%d,%d)", p, q)
+  fits[[model_name]] <- fit
+  ic <- infocriteria(fit)
+  fit_rows[[length(fit_rows) + 1L]] <- data.frame(
+    Model = model_name, p = p, q = q,
+    AIC = unname(ic[1]), BIC = unname(ic[2])
+  )
+}
+if (length(fit_rows) == 0L) stop("No candidate GARCH order converged")
+results <- do.call(rbind, fit_rows)
+results <- results[order(results$BIC), ]
+kable(head(results, 10), digits = 4,
+      caption = "Ten lowest-BIC converged Student-t GARCH models")
+```
+
+**Interpretation to complete:** State the BIC-minimizing converged order and whether it is GARCH(1,1). For comparability with the provided scripts, the remaining diagnostics continue to use `fit_t` (Student-t GARCH(1,1)) regardless of which order ranks first. This is an exploratory search, not out-of-sample model-order validation.
+
+# Student-t GARCH(1,1) estimates
+
+```{r}
+#| label: parameter-table
+params <- coef(fit_t)
+parameter_table <- data.frame(Parameter = names(params), Estimate = unname(params))
+kable(parameter_table, digits = 5, caption = "Maximum-likelihood estimates")
+
+omega <- unname(params["omega"])
+alpha <- unname(params["alpha1"])
+beta <- unname(params["beta1"])
+nu <- unname(params["shape"])
+persistence <- alpha + beta
+kable(data.frame(
+  Measure = c("ARCH + GARCH persistence", "Conditional stationary variance (when defined)"),
+  Value = c(persistence, if (persistence < 1) omega / (1 - persistence) else NA_real_)
+), digits = 5)
+```
+
+**Interpretation to complete:** Explain the estimated short-run response to new shocks ($\alpha_1$), volatility persistence ($\beta_1$ and $\alpha_1+\beta_1$), and whether the estimated $\nu$ supports relatively heavy tails. The unconditional-variance expression requires stationarity; do not interpret it as finite when $\alpha_1+\beta_1\geq1$.
+
+# Residual diagnostics
+
+If the fitted conditional mean and variance are well specified, standardized residuals $\widehat z_t=\widehat\varepsilon_t/\widehat\sigma_t$ should not display substantial remaining serial correlation or ARCH effects. These tests are diagnostic rather than proof of correct specification.
+
+```{r}
+#| label: standardized-residuals
+z <- as.numeric(residuals(fit_t, standardize = TRUE))
+acf(z, main = "ACF: standardized residuals")
+```
+
+```{r}
+#| label: squared-standardized-residuals
+acf(z^2, main = "ACF: squared standardized residuals")
+```
+
+```{r}
+#| label: residual-tests
+arch_resid <- ArchTest(z, lags = 10, demean = FALSE)
+lb_resid <- Box.test(z, lag = 20, type = "Ljung-Box")
+lb_squared <- Box.test(z^2, lag = 20, type = "Ljung-Box")
+kable(data.frame(
+  Diagnostic = c("ARCH-LM: standardized residuals", "Ljung-Box: standardized residuals", "Ljung-Box: squared standardized residuals"),
+  p_value = c(arch_resid$p.value, lb_resid$p.value, lb_squared$p.value)
+), digits = 5, caption = "Residual diagnostic p-values (unadjusted exploratory tests)")
+```
+
+**Interpretation to complete:** Discuss evidence of remaining dependence, particularly in $\widehat z_t^2$. The reported Ljung-Box p-values are unadjusted for fitted GARCH model parameters and should be interpreted cautiously.
+
+# In-sample conditional variance
+
+The model reports estimated conditional volatility $\widehat\sigma_t$; squaring gives variance in squared percentage-return units. Compare this with $10^4 r_t^2$ on the same scale.
+
+```{r}
+#| label: fig-in-sample
+#| fig-cap: "Estimated in-sample conditional variance versus squared percentage daily log returns"
+volatility <- as.numeric(sigma(fit_t))
+garch_data <- data.frame(
+  Date = train$Date,
+  Variance = volatility^2,
+  SquaredReturns = (100 * train$log_change)^2
+)
+p5 <- ggplot(garch_data, aes(x = Date)) +
+  geom_line(aes(y = Variance, colour = "GARCH conditional variance"), linewidth = 0.85) +
+  geom_line(aes(y = SquaredReturns, colour = "Squared returns"), linewidth = 0.35, alpha = 0.50) +
+  labs(title = "GARCH(1,1) conditional variance versus squared returns",
+       x = "Date", y = "Squared percentage returns", colour = "Series") +
+  theme_minimal()
+p5
+```
+
+**Interpretation to complete:** Comment on broader periods of elevated model variance rather than expecting the smooth conditional variance curve to track individual spikes in squared returns.
+
+# Out-of-sample evaluation
+
+Following the supplied plotting script, hold training-period parameter estimates fixed and filter the full return sequence. At each test observation, the conditional variance is updated from previous observations; **parameters are not re-estimated**. This is distinct from a multi-step forecast issued once at the training cutoff.
+
+```{r}
+#| label: oos-computation
+train_returns <- 100 * as.numeric(train$log_change)
+test_returns <- 100 * as.numeric(test$log_change)
+stopifnot(!anyNA(train_returns), !anyNA(test_returns))
+all_returns <- c(train_returns, test_returns)
+
+spec_fixed <- getspec(fit_t)
+setfixed(spec_fixed) <- as.list(coef(fit_t))
+filtered <- ugarchfilter(
+  spec = spec_fixed,
+  data = all_returns,
+  n.old = length(train_returns)
+)
+all_variance <- as.numeric(sigma(filtered))^2
+n_train <- length(train_returns)
+test_variance <- all_variance[seq.int(n_train + 1, length(all_variance))]
+mu_hat <- unname(coef(fit_t)["mu"])
+realised_squared <- (test_returns - mu_hat)^2
+
+forecast_results <- data.frame(
+  Date = test$Date,
+  Return = test_returns,
+  ForecastVariance = test_variance,
+  SquaredInnovation = realised_squared
+)
+stopifnot(nrow(forecast_results) == nrow(test),
+          all(forecast_results$ForecastVariance > 0))
+```
+
+```{r}
+#| label: fig-out-of-sample
+#| fig-cap: "One-step filtered conditional variance and observed squared innovations in the holdout sample. Log1p transformation used for display only."
+p_oos <- ggplot(forecast_results, aes(x = Date)) +
+  geom_line(aes(y = ForecastVariance, colour = "GARCH conditional variance"), linewidth = 0.85) +
+  geom_line(aes(y = SquaredInnovation, colour = "Squared innovation"), linewidth = 0.35, alpha = 0.5) +
+  scale_y_continuous(trans = "log1p") +
+  labs(title = "Out-of-sample Student-t GARCH(1,1) variance",
+       subtitle = "Fixed fitted parameters; sequential one-step variance updates",
+       x = "Date", y = "log(1 + squared percentage returns)", colour = "Series") +
+  theme_minimal()
+p_oos
+```
+
+Two descriptive loss functions are computed below. These describe this model's agreement with the squared-innovation proxy; **without a benchmark they do not demonstrate forecasting superiority**.
+
+$$
+\operatorname{MSE}=\frac{1}{T}\sum_{t=1}^T(\widehat\sigma_t^2-\widehat\varepsilon_t^2)^2,
+\qquad
+\operatorname{QLIKE}=\frac{1}{T}\sum_{t=1}^T\left[\log(\widehat\sigma_t^2)+\frac{\widehat\varepsilon_t^2}{\widehat\sigma_t^2}\right].
+$$
+
+```{r}
+#| label: oos-metrics
+mse <- mean((forecast_results$ForecastVariance - forecast_results$SquaredInnovation)^2)
+qlike <- mean(log(forecast_results$ForecastVariance) +
+              forecast_results$SquaredInnovation / forecast_results$ForecastVariance)
+kable(data.frame(Model = "Student-t GARCH(1,1)", MSE = mse, QLIKE = qlike),
+      digits = 5, caption = "Out-of-sample loss values, no benchmark included")
+```
+
+**Interpretation to complete:** Describe whether conditional variance increases during sustained turbulent periods and note any pronounced deviations from the squared-innovation series. To assess relative forecast value, compare with a benchmark computed on the same observations, proxy, scale, and evaluation window.
+
+# Limitations and conclusion
+
+- This is a single-asset analysis over a sample that changes when the report is re-rendered; note the actual dates shown above before reporting findings.
+- Squared daily innovations are noisy proxies for latent conditional variance.
+- Distribution and order searches are conducted on the same training period; a good in-sample BIC ranking does not establish superior out-of-sample performance.
+- The model fixes a constant mean and assumes a symmetric Student-t innovation distribution in its final working specification; leverage effects and structural breaks are not explicitly modelled.
+- The fixed-parameter sequential filter conditions on previously observed test returns. It does not refit after the training cutoff and does not use contemporaneous returns to forecast their own variance.
+
+**Conclusion to complete after rendering:** Summarize (i) evidence of squared-return dependence, (ii) information-criterion rankings, (iii) residual diagnostic outcomes, and (iv) what the out-of-sample variance comparison does and does not support. Avoid claiming statistically significant forecast improvement without a matched benchmark and appropriate comparative test.
